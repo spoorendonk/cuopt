@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
@@ -10,6 +10,10 @@ from cuopt_mps_parser.utilities import catch_mps_parser_exception
 def ParseMps(mps_file_path, fixed_mps_format=False):
     """
     Reads the equation from the input text file which is MPS formatted
+
+    See Also
+    --------
+    ParseLp : parses LP format files (for users with .lp inputs).
 
     Notes
     -----
@@ -46,6 +50,41 @@ def ParseMps(mps_file_path, fixed_mps_format=False):
     """
 
     return parser_wrapper.ParseMps(mps_file_path, fixed_mps_format)
+
+
+@catch_mps_parser_exception
+def ParseLp(lp_file_path):
+    """
+    Reads an optimization problem from a file in LP format.
+
+    The LP format is a human-readable alternative to MPS and supports LP,
+    MIP, and QP. Several solvers use slightly different LP dialects; the
+    one parsed here is documented at
+    https://docs.gurobi.com/projects/optimizer/en/current/reference/fileformats/modelformats.html#lp-format
+
+    Unsupported LP sections (SOS, semi-continuous, PWL objective, user cuts,
+    general constraints) raise a ValueError.
+
+    Parameters
+    ----------
+    lp_file_path : str
+        Path to LP-formatted file.
+
+    Returns
+    -------
+    data_model: DataModel
+        A fully formed LP/MIP/QP problem representing the given file.
+
+    Examples
+    --------
+    >>> from cuopt import linear_programming
+    >>>
+    >>> data_model = linear_programming.ParseLp(lp_file_path)
+    >>> solver_settings = linear_programming.SolverSettings()
+    >>> solution = linear_programming.Solve(data_model, solver_settings)
+    """
+
+    return parser_wrapper.ParseLp(lp_file_path)
 
 
 def toDict(model, json=False):

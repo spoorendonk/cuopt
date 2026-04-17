@@ -100,12 +100,16 @@ cuopt_int_t cuOptGetVersion(cuopt_int_t* version_major,
                             cuopt_int_t* version_patch);
 
 /**
- * @brief Read an optimization problem from an MPS file.
+ * @brief Read an optimization problem from an MPS or LP file.
  *
- * @param[in] filename - The path to the MPS file.
+ * The file format is dispatched on the extension: a case-insensitive ".lp"
+ * suffix is parsed as LP format; everything else (including ".mps",
+ * ".mps.gz", ".mps.bz2", or no extension) is parsed as MPS.
+ *
+ * @param[in] filename - The path to the MPS or LP file.
  *
  * @param[out] problem_ptr - A pointer to a cuOptOptimizationProblem. On output
- *  the problem will be created and initialized with the data from the MPS file
+ *  the problem will be created and initialized with the data from the input file.
  *
  * @return A status code indicating success or failure.
  */

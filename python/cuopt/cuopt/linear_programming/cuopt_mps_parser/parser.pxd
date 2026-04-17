@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 # cython: profile=False
@@ -42,4 +42,8 @@ cdef extern from "mps_parser/utilities/cython_mps_parser.hpp" namespace "cuopt::
     cdef unique_ptr[mps_data_model_t[int, double]] call_parse_mps(
         const string& mps_file_path,
         bool fixed_mps_format
+    ) except +
+
+    cdef unique_ptr[mps_data_model_t[int, double]] call_parse_lp(
+        const string& lp_file_path
     ) except +

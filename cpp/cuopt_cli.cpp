@@ -38,13 +38,13 @@ static char cuda_module_loading_env[] = "CUDA_MODULE_LOADING=EAGER";
  * @brief Command line interface for solving Linear Programming (LP) and Mixed Integer Programming
  * (MIP) problems using cuOpt
  *
- * This CLI provides a simple interface to solve LP/MIP problems using cuOpt. It accepts MPS format
- * input files and various solver parameters.
+ * This CLI provides a simple interface to solve LP/MIP problems using cuOpt. It accepts MPS or LP
+ * format input files (dispatched automatically by extension) and various solver parameters.
  *
  * Usage:
  * ```
- * cuopt_cli <mps_file_path> [OPTIONS]
- * cuopt_cli [OPTIONS] <mps_file_path>
+ * cuopt_cli <input_file_path> [OPTIONS]
+ * cuopt_cli [OPTIONS] <input_file_path>
  * ```
  *
  * Required arguments:
@@ -84,7 +84,9 @@ inline cuopt::init_logger_t dummy_logger(
 
 /**
  * @brief Run a single file
- * @param file_path Path to the MPS format input file containing the optimization problem
+ * @param file_path Path to the input file in MPS or LP format. Dispatched by
+ *                  extension: a ".lp" suffix routes to the LP parser; anything
+ *                  else (.mps, .mps.gz, .mps.bz2, or extensionless) to MPS.
  * @param initial_solution_file Path to initial solution file in SOL format
  * @param settings Merged solver settings (config file loaded in main, then CLI overrides applied)
  */
@@ -98,22 +100,21 @@ int run_single_file(const std::string& file_path,
 
   std::string base_filename = file_path.substr(file_path.find_last_of("/\\") + 1);
 
-  constexpr bool input_mps_strict = false;
   cuopt::mps_parser::mps_data_model_t<int, double> mps_data_model;
   bool parsing_failed = false;
   auto timer          = cuopt::timer_t(settings.get_parameter<double>(CUOPT_TIME_LIMIT));
   {
     CUOPT_LOG_INFO("Reading file %s", base_filename.c_str());
     try {
-      mps_data_model = cuopt::mps_parser::parse_mps<int, double>(file_path, input_mps_strict);
+      mps_data_model = cuopt::mps_parser::parse_optimization_file<int, double>(file_path);
     } catch (const std::logic_error& e) {
-      CUOPT_LOG_ERROR("MPS parser execption: %s", e.what());
+      CUOPT_LOG_ERROR("Parser exception: %s", e.what());
       parsing_failed = true;
     }
   }
   if (parsing_failed) {
     auto log = dummy_logger(settings);
-    CUOPT_LOG_ERROR("Parsing MPS failed. Exiting!");
+    CUOPT_LOG_ERROR("Parsing input file failed. Exiting!");
     return -1;
   }
   CUOPT_LOG_INFO("Read file %s in %.2f seconds", base_filename.c_str(), timer.elapsed_time());
@@ -279,7 +280,10 @@ int main(int argc, char* argv[])
   argparse::ArgumentParser program("cuopt_cli", version_string);
 
   // Define all arguments with appropriate defaults and help messages
-  program.add_argument("filename").help("input mps file").nargs(1).required();
+  program.add_argument("filename")
+    .help("input MPS or LP file (dispatched by .lp / .mps extension)")
+    .nargs(1)
+    .required();
 
   // FIXME: use a standard format for initial solution file
   program.add_argument("--initial-solution")
