@@ -1,7 +1,7 @@
 Command Line Interface
 ======================
 
-The cuopt_cli is a command-line interface for LP/MILP solvers that accepts MPS format files as input models. It provides command-line arguments to control all solver settings and parameters when solving linear and mixed-integer programming problems.
+The cuopt_cli is a command-line interface for LP/MILP solvers that accepts MPS or LP format files as input models (dispatched automatically by file extension — a ``.lp`` suffix is parsed as LP, everything else as MPS). It provides command-line arguments to control all solver settings and parameters when solving linear and mixed-integer programming problems.
 
 .. toctree::
    :maxdepth: 3

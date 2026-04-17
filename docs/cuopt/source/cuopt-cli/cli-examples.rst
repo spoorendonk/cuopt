@@ -1,6 +1,20 @@
 Examples
 ========
 
+Input File Format
+#################
+
+``cuopt_cli`` accepts both **MPS** and **LP** format input files. The
+format is dispatched automatically from the file extension:
+
+- ``*.lp`` → parsed as LP format (LP, MIP, and QP supported)
+- ``*.mps``, ``*.mps.gz``, ``*.mps.bz2``, or no extension → parsed as MPS
+
+The specific LP dialect parsed is documented at
+https://docs.gurobi.com/projects/optimizer/en/current/reference/fileformats/modelformats.html#lp-format.
+SOS constraints, piecewise-linear objectives, semi-continuous variables,
+user cuts and general constraint sections are rejected with a clear error.
+
 Basic Usage
 ###########
 

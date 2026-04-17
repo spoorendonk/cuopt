@@ -73,6 +73,10 @@ Example With MPS File
 
 This example demonstrates how to use the cuOpt linear programming solver in C to solve an MPS file.
 
+The same ``cuOptReadProblem`` call also accepts **LP** format files: when
+the filename has a ``.lp`` suffix it is parsed as LP, otherwise as MPS.
+See :ref:`lp-file-example-c` for an LP counterpart.
+
 The example code is available at ``examples/cuopt-c/lp/mps_file_example.c`` (:download:`download <examples/mps_file_example.c>`):
 
 .. literalinclude:: examples/mps_file_example.c
@@ -136,6 +140,41 @@ You should see the following output:
    x2 = 0.000000
 
    Solver completed successfully!
+
+
+.. _lp-file-example-c:
+
+Example With LP File
+--------------------
+
+``cuOptReadProblem`` also accepts LP format files. The same function is
+used — it dispatches on the file extension (``.lp`` ⇒ LP parser,
+otherwise MPS). LP format scope includes LP, MIP, and QP; SOS, PWL, and
+semi-continuous sections are rejected with a clear error. The specific LP
+dialect parsed is documented at
+https://docs.gurobi.com/projects/optimizer/en/current/reference/fileformats/modelformats.html#lp-format.
+
+The example code is available at ``examples/cuopt-c/lp/lp_file_example.c`` (:download:`download <examples/lp_file_example.c>`):
+
+.. literalinclude:: examples/lp_file_example.c
+   :language: c
+   :linenos:
+
+A sample LP file (:download:`download sample.lp <examples/sample.lp>`),
+equivalent to the MPS sample above:
+
+.. literalinclude:: examples/sample.lp
+   :language: text
+   :linenos:
+
+Build and run the example
+
+.. code-block:: bash
+
+   gcc -I $INCLUDE_PATH -L $LIBCUOPT_LIBRARY_PATH -o lp_file_example lp_file_example.c -lcuopt
+   ./lp_file_example sample.lp
+
+The output matches the MPS example above (same problem, same objective = -0.36).
 
 
 .. _simple-qp-example-c:
