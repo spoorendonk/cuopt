@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -143,7 +143,6 @@ class mps_parser_t {
    * the function directly reads and decompresses the compressed MPS file.
    */
   std::vector<char> file_to_string(const std::string& file);
-  void fill_problem(mps_data_model_t<i_t, f_t>& problem);
   void parse_string(char* buf);
   void parse_rows(std::string_view line);
   void parse_columns(std::string_view line);
