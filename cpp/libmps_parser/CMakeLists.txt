@@ -71,6 +71,7 @@ add_library(mps_parser SHARED
   src/data_model_view.cpp
   src/mps_data_model.cpp
   src/mps_parser.cpp
+  src/lp_parser.cpp
   src/mps_writer.cpp
   src/parser.cpp
   src/writer.cpp

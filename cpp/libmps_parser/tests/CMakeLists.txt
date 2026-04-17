@@ -54,4 +54,9 @@ endfunction()
      mps_parser_test.cpp
  )
  set_tests_properties(MPS_PARSER_TEST PROPERTIES LABELS "numopt")
+
+ ConfigureTest(LP_PARSER_TEST
+     lp_parser_test.cpp
+ )
+ set_tests_properties(LP_PARSER_TEST PROPERTIES LABELS "numopt")
 ###################################################################################################
