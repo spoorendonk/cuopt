@@ -116,7 +116,7 @@ End
   ASSERT_EQ(m.get_row_names().size(), 1u);
   int r = find_row(m, "lb_constr");
   ASSERT_GE(r, 0);
-  EXPECT_EQ(m.get_row_types()[r], 'G');
+  // 'G' relation ⇒ finite lower bound, +inf upper bound.
   EXPECT_NEAR(m.get_constraint_lower_bounds()[r], 2.5, tolerance);
   EXPECT_TRUE(std::isinf(m.get_constraint_upper_bounds()[r]));
   EXPECT_NEAR(a_entry(m, r, x), 1.0, tolerance);
@@ -192,8 +192,12 @@ End
 )LP");
 
   ASSERT_EQ(m.get_row_names().size(), 4u);
-  for (char t : m.get_row_types())
-    EXPECT_EQ(t, 'E');
+  // All four are equality constraints ⇒ lb == ub for every row.
+  const auto& clb = m.get_constraint_lower_bounds();
+  const auto& cub = m.get_constraint_upper_bounds();
+  for (size_t i = 0; i < clb.size(); ++i) {
+    EXPECT_NEAR(clb[i], cub[i], tolerance);
+  }
   int s1 = find_row(m, "s1");
   EXPECT_NEAR(m.get_constraint_lower_bounds()[s1], 10.0, tolerance);
   EXPECT_NEAR(m.get_constraint_upper_bounds()[s1], 10.0, tolerance);
@@ -216,9 +220,11 @@ End
   int eq  = find_row(m, "eq1");
   int geq = find_row(m, "geq1");
   int leq = find_row(m, "leq1");
-  EXPECT_EQ(m.get_row_types()[eq], 'E');
-  EXPECT_EQ(m.get_row_types()[geq], 'G');
-  EXPECT_EQ(m.get_row_types()[leq], 'L');
+  // Relation is recovered from the constraint lower/upper bounds:
+  //   'E' ⇒ lb == ub
+  //   'G' ⇒ ub = +inf
+  //   'L' ⇒ lb = -inf
+  EXPECT_NEAR(m.get_constraint_lower_bounds()[eq], m.get_constraint_upper_bounds()[eq], tolerance);
   EXPECT_NEAR(m.get_constraint_lower_bounds()[geq], 6.0, tolerance);
   EXPECT_TRUE(std::isinf(m.get_constraint_upper_bounds()[geq]));
   EXPECT_NEAR(m.get_constraint_upper_bounds()[leq], 8.0, tolerance);

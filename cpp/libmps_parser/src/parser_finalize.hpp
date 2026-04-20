@@ -186,15 +186,6 @@ void finalize_problem(mps_data_model_t<i_t, f_t>& problem, Parser& parser)
     problem.get_constraint_lower_bounds().size(),
     problem.get_constraint_upper_bounds().size());
 
-  // Mirror the symbolic row types (E/L/G) onto the data model so callers
-  // can recover the relation without re-inferring it from the bounds.
-  std::vector<char> row_type_chars;
-  row_type_chars.reserve(n_rows);
-  for (i_t i = 0; i < n_rows; ++i) {
-    row_type_chars.push_back(static_cast<char>(parser.row_types[i]));
-  }
-  problem.set_row_types(row_type_chars.data(), static_cast<i_t>(row_type_chars.size()));
-
   problem.set_problem_name(parser.problem_name);
   problem.set_objective_name(parser.objective_name);
   // Setters take const refs — pass the fields directly to avoid an extra
