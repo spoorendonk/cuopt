@@ -50,13 +50,8 @@ endfunction()
 
 ###################################################################################################
 # - Linear programming tests ----------------------------------------------------------------------
- ConfigureTest(MPS_PARSER_TEST
-     mps_parser_test.cpp
+ ConfigureTest(PARSER_TEST
+     parser_test.cpp
  )
- set_tests_properties(MPS_PARSER_TEST PROPERTIES LABELS "numopt")
-
- ConfigureTest(LP_PARSER_TEST
-     lp_parser_test.cpp
- )
- set_tests_properties(LP_PARSER_TEST PROPERTIES LABELS "numopt")
+ set_tests_properties(PARSER_TEST PROPERTIES LABELS "numopt")
 ###################################################################################################
