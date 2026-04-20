@@ -35,12 +35,42 @@ namespace {
 // Small character / string helpers
 // ===========================================================================
 
+// Per the LP-format convention, variable names may use letters and a specific
+// set of punctuation characters. Characters used by the grammar (+, -, *, ^,
+// :, =, <, >, [, ], \, whitespace) are excluded. Digits and '.' are valid
+// mid-name but not as the starting character.
 bool is_name_start_char(char c)
 {
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+  if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return true;
+  switch (c) {
+    case '!':
+    case '"':
+    case '#':
+    case '$':
+    case '%':
+    case '&':
+    case '(':
+    case ')':
+    case ',':
+    case ';':
+    case '?':
+    case '@':
+    case '_':
+    case '`':
+    case '\'':
+    case '{':
+    case '}':
+    case '|':
+    case '~': return true;
+    default: return false;
+  }
 }
 
-bool is_name_char(char c) { return is_name_start_char(c) || (c >= '0' && c <= '9') || c == '.'; }
+bool is_name_char(char c)
+{
+  if (is_name_start_char(c)) return true;
+  return (c >= '0' && c <= '9') || c == '.' || c == '/';
+}
 
 char to_lower(char c)
 {
@@ -142,6 +172,12 @@ class LpParseEngine {
   std::unordered_map<std::string, i_t> var_names_map_{};
   std::unordered_map<std::string, i_t> row_names_map_{};
   std::unordered_set<i_t> bounds_defined_for_var_id_{};
+  // Variables for which a lower bound was set explicitly in the Bounds
+  // section (via 'x >= lb', 'x = v', 'x free', or 'lb <= x ...'). Used to
+  // reject 'x <= -1' forms with no paired lower bound: the default lower of
+  // 0 would collide with the negative upper and silently make the variable
+  // infeasible.
+  std::unordered_set<i_t> lower_explicitly_set_{};
   // Counter used to generate row names for unlabeled constraints (R0, R1, ...).
   i_t anon_row_counter_{0};
 
@@ -295,8 +331,17 @@ void LpParseEngine<i_t, f_t>::tokenize(const std::string& text)
         ++i;
         continue;
       case '=':
-        push(LpTokenKind::Equal, "=");
-        ++i;
+        // Accept the swapped spellings: '=<' ≡ '<=' and '=>' ≡ '>='.
+        if (i + 1 < n && text[i + 1] == '<') {
+          push(LpTokenKind::LessEq, "=<");
+          i += 2;
+        } else if (i + 1 < n && text[i + 1] == '>') {
+          push(LpTokenKind::GreaterEq, "=>");
+          i += 2;
+        } else {
+          push(LpTokenKind::Equal, "=");
+          ++i;
+        }
         continue;
       default: break;
     }
@@ -489,7 +534,7 @@ bool LpParseEngine<i_t, f_t>::at_section_boundary() const
   const LpToken& t2 = peek(1);
   if (lower == "subject" && name_equals_ci(t2, "to")) return true;
   if (lower == "such" && name_equals_ci(t2, "that")) return true;
-  if (lower == "st" || lower == "s.t.") return true;
+  if (lower == "st" || lower == "st." || lower == "s.t.") return true;
   if (lower == "lazy" && name_equals_ci(t2, "constraints")) return true;
   if (lower == "user" && name_equals_ci(t2, "cuts")) return true;
   // "General Constraints" is unsupported but still a section boundary;
@@ -560,7 +605,7 @@ typename LpParseEngine<i_t, f_t>::SectionKind LpParseEngine<i_t, f_t>::try_consu
     advance();
     return SectionKind::Constraints;
   }
-  if (lower == "st" || lower == "s.t.") {
+  if (lower == "st" || lower == "st." || lower == "s.t.") {
     advance();
     return SectionKind::Constraints;
   }
@@ -769,14 +814,18 @@ void LpParseEngine<i_t, f_t>::parse_quadratic_bracket(std::vector<LinearTerm>& o
   }
   expect(LpTokenKind::RBracket, "closing ']' of quadratic section");
 
-  // Optional "/ 2" suffix.
-  bool has_div2 = false;
-  if (peek().kind == LpTokenKind::Slash && peek(1).kind == LpTokenKind::Number &&
-      peek(1).text == "2") {
-    advance();
-    advance();
-    has_div2 = true;
-  }
+  // Require the "/ 2" suffix after a quadratic objective expression.
+  // Without it there is no ambiguity-free way to tell whether the user
+  // meant /2 and forgot vs. intended bare coefficients, so we enforce the
+  // stricter form.
+  mps_parser_expects(
+    peek().kind == LpTokenKind::Slash && peek(1).kind == LpTokenKind::Number && peek(1).text == "2",
+    error_type_t::ValidationError,
+    "LP parse error at line %d: quadratic expression '[ ... ]' in the "
+    "objective must be followed by '/ 2'",
+    peek().line);
+  advance();  // '/'
+  advance();  // '2'
 
   // Apply the /2 convention and the QUADOBJ-convention scaling so that
   // finalize_problem()'s expansion to full symmetric and *0.5 factor yield
@@ -785,26 +834,17 @@ void LpParseEngine<i_t, f_t>::parse_quadratic_bracket(std::vector<LinearTerm>& o
   //   LP term ([...]/2):                    →  quadobj entry
   //     diagonal  c x^2   (actual = c/2)    →  c
   //     off-diag  c x*y   (actual = c/2)    →  c/2
-  //   LP term ([...]) (no /2):
-  //     diagonal  c x^2   (actual = c)      →  2c
-  //     off-diag  c x*y   (actual = c)      →  c
   const f_t sign_scale = static_cast<f_t>(outer_sign);
   for (auto& [a, b, v] : raw_quad) {
-    if (a == b) {
-      // diagonal: * 2 when no /2
-      if (!has_div2) v *= f_t(2);
-    } else {
-      // off-diagonal: / 2 when /2 present
-      if (has_div2) v /= f_t(2);
+    if (a != b) {
+      // off-diagonal: /2 to recover Q[i,j] = Q[j,i] after the later x^T Q x expansion.
+      v /= f_t(2);
     }
     out_.quadobj_entries.emplace_back(a, b, sign_scale * v);
   }
-  // Linear terms inside the brackets also pick up the /2 scaling, then the
-  // outer sign.
-  if (has_div2) {
-    for (auto& lt : out_linear)
-      lt.coeff /= f_t(2);
-  }
+  // Linear terms inside the brackets pick up the /2 scaling and the outer sign.
+  for (auto& lt : out_linear)
+    lt.coeff /= f_t(2);
   if (outer_sign < 0) {
     for (auto& lt : out_linear)
       lt.coeff = -lt.coeff;
@@ -958,17 +998,20 @@ void LpParseEngine<i_t, f_t>::parse_bounds_section()
         advance();
         out_.variable_lower_bounds[vid] = -std::numeric_limits<f_t>::infinity();
         out_.variable_upper_bounds[vid] = std::numeric_limits<f_t>::infinity();
+        lower_explicitly_set_.insert(vid);
       } else if (match(LpTokenKind::LessEq)) {
         // x <= ub
         out_.variable_upper_bounds[vid] = parse_signed_number();
       } else if (match(LpTokenKind::GreaterEq)) {
         // x >= lb
         out_.variable_lower_bounds[vid] = parse_signed_number();
+        lower_explicitly_set_.insert(vid);
       } else if (match(LpTokenKind::Equal)) {
         // x = value (fixed)
         f_t v                           = parse_signed_number();
         out_.variable_lower_bounds[vid] = v;
         out_.variable_upper_bounds[vid] = v;
+        lower_explicitly_set_.insert(vid);
       } else {
         mps_parser_expects(false,
                            error_type_t::ValidationError,
@@ -990,7 +1033,25 @@ void LpParseEngine<i_t, f_t>::parse_bounds_section()
       i_t vid = get_or_add_var(var_name);
       bounds_defined_for_var_id_.insert(vid);
       out_.variable_lower_bounds[vid] = lb;
+      lower_explicitly_set_.insert(vid);
       if (match(LpTokenKind::LessEq)) { out_.variable_upper_bounds[vid] = parse_signed_number(); }
+    }
+  }
+
+  // A negative upper bound requires an explicitly stated lower bound,
+  // otherwise the default lower of 0 would collide with the upper and make
+  // the variable silently infeasible. Flag this at parse time.
+  for (i_t vid : bounds_defined_for_var_id_) {
+    if (out_.variable_upper_bounds[vid] < f_t(0) && !lower_explicitly_set_.count(vid)) {
+      mps_parser_expects(false,
+                         error_type_t::ValidationError,
+                         "LP parse error: variable '%s' has a negative upper bound (%g) "
+                         "without an explicit lower bound. Write '-inf <= %s <= %g' or give "
+                         "an explicit lower bound alongside the upper bound.",
+                         out_.var_names[vid].c_str(),
+                         static_cast<double>(out_.variable_upper_bounds[vid]),
+                         out_.var_names[vid].c_str(),
+                         static_cast<double>(out_.variable_upper_bounds[vid]));
     }
   }
 }

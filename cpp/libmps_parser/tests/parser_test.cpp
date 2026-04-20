@@ -1847,20 +1847,19 @@ End
   EXPECT_NEAR(a_entry(m, r, x), -1.0, tolerance);
 }
 
-TEST(lp_parser, quadratic_without_slash_two_divides_coefficients_in_place)
+TEST(lp_parser, quadratic_without_slash_two_is_rejected)
 {
-  // Without "/ 2" the raw coefficient IS the actual coefficient.
-  // [ 1 x^2 ]  ⇒  Q[x,x] = 1.
-  auto m = parse_lp_string(R"LP(
+  // The quadratic bracket in the objective must be followed by '/ 2'.
+  // Without it there's no unambiguous way to tell whether the user meant
+  // '/ 2' and forgot or intended the bare coefficients, so cuopt rejects.
+  EXPECT_THROW(parse_lp_string(R"LP(
 Minimize
   [ 1 x ^2 ]
 Subject To
  c1: x >= 1
 End
-)LP");
-  ASSERT_TRUE(m.has_quadratic_objective());
-  int x = find_var(m, "x");
-  EXPECT_NEAR(q_entry(m, x, x), 1.0, tolerance);
+)LP"),
+               std::logic_error);
 }
 
 TEST(lp_parser, duplicate_coefficient_accumulates)
@@ -1877,6 +1876,119 @@ End
   int y  = find_var(m, "y");
   EXPECT_NEAR(m.get_objective_coefficients()[x], 5.0, tolerance);
   EXPECT_NEAR(m.get_objective_coefficients()[y], 1.0, tolerance);
+}
+
+TEST(lp_parser, subject_to_variant_st_dot)
+{
+  // 'st.' with a trailing period is a Subject-To synonym in the LP-format
+  // convention.
+  auto m = parse_lp_string(R"LP(
+Minimize
+  x
+st.
+ c: x >= 1
+End
+)LP");
+  EXPECT_EQ(m.get_row_names().size(), 1u);
+  EXPECT_EQ(m.get_row_names()[0], "c");
+}
+
+TEST(lp_parser, swapped_relational_operators_eq_lt_and_eq_gt)
+{
+  // '=<' is an alias for '<=' and '=>' for '>=', in both constraints and
+  // bounds. Tokenizer must produce LessEq / GreaterEq tokens regardless of
+  // spelling.
+  auto m   = parse_lp_string(R"LP(
+Minimize
+  x + y
+Subject To
+ c_le: x + y =< 10
+ c_ge: x + y => 1
+Bounds
+ y =< 5
+ x => 0
+End
+)LP");
+  int c_le = find_row(m, "c_le");
+  int c_ge = find_row(m, "c_ge");
+  EXPECT_TRUE(std::isinf(-m.get_constraint_lower_bounds()[c_le]));
+  EXPECT_NEAR(m.get_constraint_upper_bounds()[c_le], 10.0, tolerance);
+  EXPECT_NEAR(m.get_constraint_lower_bounds()[c_ge], 1.0, tolerance);
+  EXPECT_TRUE(std::isinf(m.get_constraint_upper_bounds()[c_ge]));
+  int x = find_var(m, "x");
+  int y = find_var(m, "y");
+  EXPECT_NEAR(m.get_variable_upper_bounds()[y], 5.0, tolerance);
+  EXPECT_NEAR(m.get_variable_lower_bounds()[x], 0.0, tolerance);
+}
+
+TEST(lp_parser, variable_names_with_special_characters)
+{
+  // Per the LP-format convention, variable names may contain assorted
+  // punctuation beyond letters + underscore. The names are treated as
+  // opaque identifiers; cuopt just has to keep them distinct.
+  auto m = parse_lp_string(R"LP(
+Minimize
+  x!a + x#b + x$c + x@d + x'e + x~f + x.g + x_h + x|i + x{j} + x(k) + a/b
+Subject To
+ c1: x!a + x#b + x$c + x@d + x'e + x~f + x.g + x_h + x|i + x{j} + x(k) + a/b >= 1
+End
+)LP");
+  ASSERT_EQ(m.get_variable_names().size(), 12u);
+  for (const std::string& n :
+       {"x!a", "x#b", "x$c", "x@d", "x'e", "x~f", "x.g", "x_h", "x|i", "x{j}", "x(k)", "a/b"}) {
+    EXPECT_GE(find_var(m, n), 0) << "missing variable '" << n << "'";
+  }
+}
+
+TEST(lp_parser, negative_upper_without_explicit_lower_throws)
+{
+  // 'x <= -1' with no explicit lower makes the default lb=0 collide with the
+  // upper. cuopt rejects rather than accept a silently infeasible problem.
+  EXPECT_THROW(parse_lp_string(R"LP(
+Minimize
+  x
+Subject To
+ c: x <= 10
+Bounds
+ x <= -1
+End
+)LP"),
+               std::logic_error);
+}
+
+TEST(lp_parser, negative_upper_with_explicit_lower_ok)
+{
+  // Same test as above, but now the lower bound is explicit: no error.
+  auto m = parse_lp_string(R"LP(
+Minimize
+  x
+Subject To
+ c: x <= 10
+Bounds
+ x >= -5
+ x <= -1
+End
+)LP");
+  int x  = find_var(m, "x");
+  EXPECT_NEAR(m.get_variable_lower_bounds()[x], -5.0, tolerance);
+  EXPECT_NEAR(m.get_variable_upper_bounds()[x], -1.0, tolerance);
+}
+
+TEST(lp_parser, negative_upper_with_range_bound_ok)
+{
+  // -5 <= x <= -1 declares both bounds in a single line: no error.
+  auto m = parse_lp_string(R"LP(
+Minimize
+  x
+Subject To
+ c: x <= 10
+Bounds
+ -5 <= x <= -1
+End
+)LP");
+  int x  = find_var(m, "x");
+  EXPECT_NEAR(m.get_variable_lower_bounds()[x], -5.0, tolerance);
+  EXPECT_NEAR(m.get_variable_upper_bounds()[x], -1.0, tolerance);
 }
 
 // ================================================================================================
