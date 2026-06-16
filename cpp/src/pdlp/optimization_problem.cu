@@ -305,6 +305,30 @@ void optimization_problem_t<i_t, f_t>::set_problem_category(const problem_catego
 }
 
 template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_n_variables(i_t n_variables)
+{
+  n_vars_ = n_variables;
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::set_n_constraints(i_t n_constraints)
+{
+  n_constraints_ = n_constraints;
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::clear_row_types()
+{
+  row_types_.resize(0, stream_view_);
+}
+
+template <typename i_t, typename f_t>
+void optimization_problem_t<i_t, f_t>::clear_constraint_bounds()
+{
+  b_.resize(0, stream_view_);
+}
+
+template <typename i_t, typename f_t>
 void optimization_problem_t<i_t, f_t>::set_constraint_lower_bounds(
   const f_t* constraint_lower_bounds, i_t size)
 {
