@@ -78,6 +78,43 @@ if (NOT SKIP_C_PYTHON_ADAPTERS)
         DESTINATION bin/gtests/libcuopt
         EXCLUDE_FROM_ALL
     )
+
+    # Delta C API tests. These exercise the public cuOpt delta surface
+    # (cuOptAddColumns / cuOptResolve / ...) directly from C++ and need no
+    # c_api_tester C helper.
+    add_executable(DELTA_API_TEST "${CMAKE_CURRENT_SOURCE_DIR}/c_api_tests/delta_api_tests.cpp")
+
+    target_include_directories(DELTA_API_TEST
+        PRIVATE
+        "${CUOPT_TEST_DIR}/../src"
+        "${CUOPT_TEST_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/c_api_tests"
+    )
+
+    target_link_libraries(DELTA_API_TEST
+        PRIVATE
+        cuopt
+        cuopttestutils
+        GTest::gmock
+        GTest::gmock_main
+        GTest::gtest
+        GTest::gtest_main
+        ${CUOPT_PRIVATE_CUDA_LIBS}
+    )
+
+    if(NOT DEFINED INSTALL_TARGET OR "${INSTALL_TARGET}" STREQUAL "")
+      target_link_options(DELTA_API_TEST PRIVATE -Wl,--enable-new-dtags)
+    endif()
+
+    add_test(NAME DELTA_API_TEST COMMAND DELTA_API_TEST)
+    set_tests_properties(DELTA_API_TEST PROPERTIES LABELS "numopt")
+
+    install(
+        TARGETS DELTA_API_TEST
+        COMPONENT testing
+        DESTINATION bin/gtests/libcuopt
+        EXCLUDE_FROM_ALL
+    )
 endif()
 
 # ##################################################################################################
