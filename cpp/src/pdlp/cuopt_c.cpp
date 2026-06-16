@@ -33,11 +33,13 @@ using cuopt::mathematical_optimization::char_to_var_type;
 using cuopt::mathematical_optimization::csc_matrix_t;
 using cuopt::mathematical_optimization::csr_matrix_t;
 using cuopt::mathematical_optimization::get_memory_backend_type;
+using cuopt::mathematical_optimization::get_settings_handle;
 using cuopt::mathematical_optimization::is_valid_public_var_type_code;
 using cuopt::mathematical_optimization::optimization_problem_interface_t;
 using cuopt::mathematical_optimization::problem_and_stream_view_t;
 using cuopt::mathematical_optimization::problem_category_t;
 using cuopt::mathematical_optimization::solution_and_stream_view_t;
+using cuopt::mathematical_optimization::solver_settings_handle_t;
 using cuopt::mathematical_optimization::solver_settings_t;
 using cuopt::mathematical_optimization::var_t;
 using cuopt::mathematical_optimization::var_type_to_char;
@@ -83,18 +85,9 @@ class c_set_solution_callback_t : public cuopt::internals::set_solution_callback
   cuOptMIPSetSolutionCallback callback_;
 };
 
-// Owns solver settings and C callback wrappers for C API lifetime.
-struct solver_settings_handle_t {
-  solver_settings_handle_t() : settings(new solver_settings_t<cuopt_int_t, cuopt_float_t>()) {}
-  ~solver_settings_handle_t() { delete settings; }
-  solver_settings_t<cuopt_int_t, cuopt_float_t>* settings;
-  std::vector<std::unique_ptr<cuopt::internals::base_solution_callback_t>> callbacks;
-};
-
-solver_settings_handle_t* get_settings_handle(cuOptSolverSettings settings)
-{
-  return static_cast<solver_settings_handle_t*>(settings);
-}
+// solver_settings_handle_t and get_settings_handle were lifted into
+// <pdlp/cuopt_c_internal.hpp> so cuopt_c_delta.cpp can reach the settings
+// through the opaque handle too.
 
 namespace {
 
