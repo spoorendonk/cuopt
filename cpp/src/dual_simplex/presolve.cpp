@@ -1292,7 +1292,12 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
     }
   }
 
-  // Check for empty rows
+  // Check for empty rows. This stays UNCONDITIONAL even when
+  // inner_presolve_optimizations is off: remove_empty_rows also performs the
+  // 0 = beta infeasibility check on each empty row (a zero row with a nonzero
+  // RHS is infeasible), so gating it would drop a correctness check and feed a
+  // zero row of A to the barrier solver. The scan is cheap (one
+  // to_compressed_row + an O(num_rows) pass).
   i_t num_empty_rows = 0;
   {
     csr_matrix_t<i_t, f_t> Arow(0, 0, 0);
@@ -1307,16 +1312,25 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
     if (i != 0) { return -1; }
   }
 
-  // Check for empty cols
-  i_t num_empty_cols = 0;
-  {
-    for (i_t j = 0; j < linear_cols; ++j) {
-      if ((problem.A.col_start[j + 1] - problem.A.col_start[j]) == 0) { num_empty_cols++; }
+  // Empty-col removal is an optional optimization pass. Gated by
+  // inner_presolve_optimizations (default true; run_barrier flips it false) —
+  // by the time the inner presolve runs in the barrier path, the outer
+  // PSLP/Papilo pass has typically done equivalent work, and re-running on an
+  // already-clean LP is wasted CPU time. Skipping leaves any genuinely empty
+  // cols in place; barrier sees them as zero columns of A, which solve
+  // correctly (just slightly larger).
+  if (settings.inner_presolve_optimizations) {
+    // Check for empty cols
+    i_t num_empty_cols = 0;
+    {
+      for (i_t j = 0; j < linear_cols; ++j) {
+        if ((problem.A.col_start[j + 1] - problem.A.col_start[j]) == 0) { num_empty_cols++; }
+      }
     }
-  }
-  if (num_empty_cols > 0) {
-    settings.log.printf("Presolve attempt to remove %d empty cols\n", num_empty_cols);
-    remove_empty_cols(problem, num_empty_cols, presolve_info);
+    if (num_empty_cols > 0) {
+      settings.log.printf("Presolve attempt to remove %d empty cols\n", num_empty_cols);
+      remove_empty_cols(problem, num_empty_cols, presolve_info);
+    }
   }
 
   // Check for free variables (exclude cone variables — they are naturally unbounded)
@@ -1399,7 +1413,11 @@ i_t presolve(const lp_problem_t<i_t, f_t>& original,
     problem.num_cols = num_cols;
   }
 
-  if (settings.barrier_presolve && settings.folding != 0 && problem.Q.n == 0 && !has_cones) {
+  // Folding is an optional optimization pass — gated on
+  // inner_presolve_optimizations (default true; run_barrier flips it false) on
+  // top of the existing folding / Q-presence / cone gates.
+  if (settings.inner_presolve_optimizations && settings.barrier_presolve &&
+      settings.folding != 0 && problem.Q.n == 0 && !has_cones) {
     folding(problem, settings, presolve_info);
   }
 

@@ -80,6 +80,7 @@ struct simplex_solver_settings_t {
       eliminate_singletons(true),
       print_presolve_stats(true),
       barrier_presolve(false),
+      inner_presolve_optimizations(true),
       cudss_deterministic(false),
       deterministic(false),
       barrier(false),
@@ -166,8 +167,14 @@ struct simplex_solver_settings_t {
   bool
     use_left_looking_lu;  // true to use left looking LU factorization, false to use right looking
   bool eliminate_singletons;  // true to eliminate singletons from the basis
-  bool print_presolve_stats;  // true to print presolve stats
-  bool barrier_presolve;      // true to use barrier presolve
+  bool print_presolve_stats;          // true to print presolve stats
+  bool barrier_presolve;              // true to use barrier presolve
+  bool inner_presolve_optimizations;  // true to run optional passes inside dual_simplex::presolve
+                                      // (empty row/col removal, folding). Mandatory correctness
+                                      // transforms for barrier (LB shift, free-var v-w split,
+                                      // gated by barrier_presolve) ALWAYS run. Default true;
+                                      // run_barrier flips to false because outer PSLP/Papilo has
+                                      // typically done equivalent work already.
   bool cudss_deterministic;   // true to use cuDSS deterministic mode, false for non-deterministic
   bool barrier;               // true to use barrier method, false to use dual simplex method
   bool deterministic;  // true to use B&B deterministic mode, false to use non-deterministic mode
