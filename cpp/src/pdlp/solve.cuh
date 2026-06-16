@@ -11,7 +11,11 @@
 
 #include <cuopt/linear_programming/io/mps_data_model.hpp>
 
+#include <dual_simplex/user_problem.hpp>
+
 #include <raft/core/handle.hpp>
+
+#include <optional>
 
 namespace cuopt::linear_programming {
 

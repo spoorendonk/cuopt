@@ -42,9 +42,14 @@
 
 #include <barrier/sparse_cholesky.cuh>
 
+#include <cuts/cuts.hpp>
 #include <dual_simplex/crossover.hpp>
+#include <dual_simplex/phase1.hpp>
+#include <dual_simplex/phase2.hpp>
 #include <dual_simplex/solve.hpp>
 #include <dual_simplex/tic_toc.hpp>
+#include <dual_simplex/vector_math.hpp>
+#include <pdlp/dual_simplex_warm_state.hpp>
 #include <pdlp/utilities/problem_checking.cuh>
 
 #include <raft/sparse/detail/cusparse_wrappers.h>
@@ -487,6 +492,622 @@ optimization_problem_solution_t<i_t, f_t> convert_dual_simplex_sol(
                                   method);
 }
 
+// ===========================================================================
+// Dual-simplex warm-state layer (mcfcg issue #22).
+//
+// See dual_simplex_warm_state.hpp for the design rationale. The functions
+// below are the implementation of solve_lp_dual_simplex_warm. They live in
+// solve.cu so they can reuse convert_dual_simplex_sol and the dual_simplex
+// internals already linked here.
+// ===========================================================================
+namespace warm_ds {
+
+// The simplex settings used for every warm-state dual-simplex solve. These
+// flags make dual_simplex::presolve + scaling the identity on a clean LP so the
+// captured basis is in `lp` (converted) coordinates and stays transplantable
+// across resolves (see header). They intentionally diverge from the default
+// run_dual_simplex settings (which scale + presolve), trading a little
+// per-solve conditioning for a persistable, coordinate-stable basis. Objective
+// parity with a cold solve is unaffected — the LP solved is identical.
+template <typename i_t, typename f_t>
+dual_simplex::simplex_solver_settings_t<i_t, f_t> make_warm_settings(
+  pdlp_solver_settings_t<i_t, f_t> const& settings)
+{
+  dual_simplex::simplex_solver_settings_t<i_t, f_t> s;
+  s.time_limit                   = settings.time_limit;
+  s.iteration_limit              = settings.iteration_limit;
+  s.concurrent_halt              = settings.concurrent_halt;
+  s.scale_columns                = false;
+  s.inner_presolve_optimizations = false;
+  s.eliminate_singletons         = false;
+  s.barrier_presolve             = false;
+  s.barrier                      = false;
+  s.dualize                      = 0;
+  s.crossover                    = false;
+  s.set_log(false);
+  return s;
+}
+
+// Per-column / per-row signatures used to detect a tail-only structural
+// extension. We compare the previous user_problem's prefix against the new one;
+// if every existing column (obj, bounds, nnz) and every existing row (rhs,
+// sense) is unchanged, the change is a pure append and the basis can be
+// transplanted.
+template <typename i_t, typename f_t>
+void snapshot_user_problem(const dual_simplex::user_problem_t<i_t, f_t>& up,
+                           dual_simplex_warm_state_t<i_t, f_t>& state)
+{
+  const i_t n = up.num_cols;
+  const i_t m = up.num_rows;
+  state.user_num_cols          = n;
+  state.user_num_rows          = m;
+  state.prev_user_num_range_rows = up.num_range_rows;
+  state.prev_user_obj.assign(up.objective.begin(), up.objective.begin() + n);
+  state.prev_user_lower.assign(up.lower.begin(), up.lower.begin() + n);
+  state.prev_user_upper.assign(up.upper.begin(), up.upper.begin() + n);
+  state.prev_user_col_nnz.resize(n);
+  for (i_t j = 0; j < n; ++j) {
+    state.prev_user_col_nnz[j] = up.A.col_start[j + 1] - up.A.col_start[j];
+  }
+  state.prev_user_rhs.assign(up.rhs.begin(), up.rhs.begin() + m);
+  state.prev_user_row_sense.assign(up.row_sense.begin(), up.row_sense.begin() + m);
+}
+
+// Returns true iff `up` is a tail-only structural extension of the snapshot in
+// `state`: same-or-more rows and columns, every previously-seen column /
+// row unchanged, no range rows, and no 'G' / 'L' sense among the appended rows
+// other than what we can transplant. We only transplant when the appended rows
+// are all equality ('E') or less-than ('L'); 'G' rows or range rows on the
+// append force a cold rebuild (they need sign flips / extra slacks that the
+// simple tail-append below does not model). The common mcfcg master shapes
+// (equality demand/convexity rows + '<=' capacity rows appended lazily) are
+// covered.
+template <typename i_t, typename f_t>
+bool is_tail_extension(const dual_simplex::user_problem_t<i_t, f_t>& up,
+                       const dual_simplex_warm_state_t<i_t, f_t>& state)
+{
+  if (!state.has_basis) { return false; }
+  if (up.num_cols < state.user_num_cols) { return false; }
+  if (up.num_rows < state.user_num_rows) { return false; }
+  if (up.num_range_rows != 0 || state.prev_user_num_range_rows != 0) { return false; }
+
+  // Every previously-existing column must be byte-identical (obj / bounds /
+  // column nnz). A coefficient edit inside an existing column changes nnz only
+  // if a structural zero appears, but an in-place value change keeps nnz; to be
+  // safe we also re-validate the appended-row column indices below. We do NOT
+  // attempt to detect a pure value edit on an existing entry here — mcfcg never
+  // does that on the master (columns are immutable once added), and a value
+  // edit would be caught by the post-solve objective being recomputed against
+  // the freshly-converted LP only on the cold path. To stay correct-by-
+  // construction we treat any nnz/bound/obj mismatch as "not an extension".
+  for (i_t j = 0; j < state.user_num_cols; ++j) {
+    if (up.objective[j] != state.prev_user_obj[j]) { return false; }
+    if (up.lower[j] != state.prev_user_lower[j]) { return false; }
+    if (up.upper[j] != state.prev_user_upper[j]) { return false; }
+    if ((up.A.col_start[j + 1] - up.A.col_start[j]) != state.prev_user_col_nnz[j]) {
+      return false;
+    }
+  }
+  for (i_t i = 0; i < state.user_num_rows; ++i) {
+    if (up.rhs[i] != state.prev_user_rhs[i]) { return false; }
+    if (up.row_sense[i] != state.prev_user_row_sense[i]) { return false; }
+    // BUG 1 guard: convert_user_problem -> convert_greater_to_less NEGATES the
+    // coefficients (and RHS) of every '>=' ('G') row when it first builds
+    // state.lp. The warm column-append path copies appended-column entries
+    // straight from up.A (user space, un-negated), which would land with the
+    // WRONG SIGN in a 'G' row of state.lp. We do not model that per-row sign
+    // transform on the append path, so any existing 'G' row makes the whole
+    // warm transplant unsafe: force a cold rebuild. (Appended rows are already
+    // restricted to 'E'/'L' below, so after a clean cold rebuild on an all-
+    // 'E'/'L' base — the mcfcg master case — no 'G' row ever appears here.)
+    if (up.row_sense[i] == 'G') { return false; }
+  }
+  // Appended rows must be 'E' or 'L' (no 'G', no range).
+  for (i_t i = state.user_num_rows; i < up.num_rows; ++i) {
+    const char s = up.row_sense[i];
+    if (s != 'E' && s != 'L') { return false; }
+  }
+  return true;
+}
+
+// Insert `count` brand-new structural columns (taken from user columns
+// [old_user_cols, old_user_cols + count) of `up`) into the persisted converted
+// `lp`, placed immediately after the existing structural columns and BEFORE the
+// slack block, so the converted layout [structural | slacks] is preserved.
+// Slack column indices shift up by `count`; basic_list / nonbasic_list /
+// new_slacks references to those slack columns are remapped. The appended
+// columns enter nonbasic at their lower bound (vstatus NONBASIC_LOWER,
+// edge_norm 1.0). The basis matrix B (basic columns) is unchanged because no
+// new column is basic — so basis_update is untouched.
+template <typename i_t, typename f_t>
+void append_nonbasic_columns(const dual_simplex::user_problem_t<i_t, f_t>& up,
+                             i_t old_user_cols,
+                             i_t count,
+                             dual_simplex_warm_state_t<i_t, f_t>& state)
+{
+  auto& lp = *state.lp;
+  // The number of slack columns currently in lp is (lp.num_cols - structural).
+  // Structural column count == old_user_cols (user columns are a prefix of lp).
+  const i_t structural = old_user_cols;
+  const i_t old_cols   = lp.num_cols;
+  const i_t num_slacks = old_cols - structural;
+  const i_t new_cols   = old_cols + count;
+
+  // BUG 2 guard: when a column AND a row are appended in the SAME resolve, the
+  // freshly converted up.A already contains the appended rows, so a new
+  // column's entry in one of those new rows has row index >= old lp.num_rows.
+  // Those entries belong to the CUT, not to the existing-basis column block:
+  // add_cuts (via append_cut_rows) re-reads them from up.A and folds the new
+  // column's coefficient into the new row. We therefore copy ONLY entries whose
+  // row index is < the OLD lp.num_rows here. Copying a >= old-num_rows index
+  // would (a) write out of bounds when add_cuts' to_compressed_row indexes by
+  // row, and (b) double-count the coefficient (once here, once in add_cuts).
+  const i_t old_num_rows = lp.num_rows;
+
+  // Count nnz of the new structural columns from the user CSC matrix, counting
+  // only entries that fall in the OLD rows (entries in appended rows are
+  // handled by add_cuts). This is an exact upper bound on what we write below.
+  i_t add_nnz = 0;
+  for (i_t k = 0; k < count; ++k) {
+    const i_t uj = old_user_cols + k;
+    for (i_t p = up.A.col_start[uj]; p < up.A.col_start[uj + 1]; ++p) {
+      if (up.A.i[p] < old_num_rows) { ++add_nnz; }
+    }
+  }
+
+  dual_simplex::csc_matrix_t<i_t, f_t> new_A(lp.num_rows, new_cols, lp.A.col_start[old_cols] + add_nnz);
+  std::vector<f_t> new_obj(new_cols);
+  std::vector<f_t> new_lower(new_cols);
+  std::vector<f_t> new_upper(new_cols);
+
+  i_t nz = 0;
+  // 1) existing structural columns [0, structural).
+  for (i_t j = 0; j < structural; ++j) {
+    new_A.col_start[j] = nz;
+    new_obj[j]   = lp.objective[j];
+    new_lower[j] = lp.lower[j];
+    new_upper[j] = lp.upper[j];
+    for (i_t p = lp.A.col_start[j]; p < lp.A.col_start[j + 1]; ++p) {
+      new_A.i[nz] = lp.A.i[p];
+      new_A.x[nz] = lp.A.x[p];
+      ++nz;
+    }
+  }
+  // 2) the `count` new structural columns, inserted right after.
+  for (i_t k = 0; k < count; ++k) {
+    const i_t j  = structural + k;
+    const i_t uj = old_user_cols + k;
+    new_A.col_start[j] = nz;
+    new_obj[j]   = up.objective[uj];
+    new_lower[j] = up.lower[uj];
+    new_upper[j] = up.upper[uj];
+    for (i_t p = up.A.col_start[uj]; p < up.A.col_start[uj + 1]; ++p) {
+      // Skip entries in appended rows (row index >= old_num_rows): add_cuts
+      // folds them in from up.A. See BUG 2 guard above.
+      if (up.A.i[p] >= old_num_rows) { continue; }
+      new_A.i[nz] = up.A.i[p];
+      new_A.x[nz] = up.A.x[p];
+      ++nz;
+    }
+  }
+  // 3) the old slack columns [structural, old_cols), shifted up by `count`.
+  for (i_t s = 0; s < num_slacks; ++s) {
+    const i_t old_j = structural + s;
+    const i_t new_j = structural + count + s;
+    new_A.col_start[new_j] = nz;
+    new_obj[new_j]   = lp.objective[old_j];
+    new_lower[new_j] = lp.lower[old_j];
+    new_upper[new_j] = lp.upper[old_j];
+    for (i_t p = lp.A.col_start[old_j]; p < lp.A.col_start[old_j + 1]; ++p) {
+      new_A.i[nz] = lp.A.i[p];
+      new_A.x[nz] = lp.A.x[p];
+      ++nz;
+    }
+  }
+  new_A.col_start[new_cols] = nz;
+  new_A.n                   = new_cols;
+
+  lp.A         = new_A;
+  lp.objective = std::move(new_obj);
+  lp.lower     = std::move(new_lower);
+  lp.upper     = std::move(new_upper);
+  lp.num_cols  = new_cols;
+
+  // Remap any column index >= structural (a slack) up by `count` in the basis
+  // bookkeeping, then append the new structural columns as nonbasic.
+  auto shift_slack = [structural, count](i_t j) {
+    return j >= structural ? j + count : j;
+  };
+  for (i_t& j : state.basic_list) { j = shift_slack(j); }
+  for (i_t& j : state.nonbasic_list) { j = shift_slack(j); }
+  for (i_t& j : state.new_slacks) { j = shift_slack(j); }
+
+  // vstatus / edge_norms are indexed by column; rebuild them in the new layout.
+  std::vector<dual_simplex::variable_status_t> new_vstatus(new_cols);
+  std::vector<f_t> new_edge_norms(new_cols);
+  for (i_t j = 0; j < structural; ++j) {
+    new_vstatus[j]    = state.vstatus[j];
+    new_edge_norms[j] = state.edge_norms[j];
+  }
+  for (i_t k = 0; k < count; ++k) {
+    const i_t j = structural + k;
+    // New column nonbasic at its lower bound (or free if unbounded both sides).
+    if (lp.lower[j] == -std::numeric_limits<f_t>::infinity() &&
+        lp.upper[j] == std::numeric_limits<f_t>::infinity()) {
+      new_vstatus[j] = dual_simplex::variable_status_t::NONBASIC_FREE;
+    } else if (lp.lower[j] == -std::numeric_limits<f_t>::infinity()) {
+      new_vstatus[j] = dual_simplex::variable_status_t::NONBASIC_UPPER;
+    } else {
+      new_vstatus[j] = dual_simplex::variable_status_t::NONBASIC_LOWER;
+    }
+    new_edge_norms[j] = 1.0;
+    state.nonbasic_list.push_back(j);
+  }
+  for (i_t s = 0; s < num_slacks; ++s) {
+    new_vstatus[structural + count + s]    = state.vstatus[structural + s];
+    new_edge_norms[structural + count + s] = state.edge_norms[structural + s];
+  }
+  state.vstatus    = std::move(new_vstatus);
+  state.edge_norms = std::move(new_edge_norms);
+}
+
+// Append `count` brand-new '<='/'==' rows (user rows [old_user_rows,
+// old_user_rows + count)) to the persisted `lp` and its basis via
+// dual_simplex::add_cuts. add_cuts treats each new row as a cut C*x <= d and
+// appends its logical slack at the tail, updating basis_update so the slack is
+// basic — exactly the structure of a lazily-added '<=' capacity row. For an
+// '==' appended row we still model it as two-sided via a 0-width slack? No:
+// add_cuts always adds a >=0 slack (a <= row). To keep equality rows exact we
+// instead append them directly with a fixed (0..0) slack. To avoid that
+// complexity and stay correct-by-construction, equality appends fall back to a
+// cold rebuild (is_tail_extension allows 'E', but the caller only invokes this
+// helper for 'L' rows; mixed appends route to cold). See caller.
+template <typename i_t, typename f_t>
+i_t append_cut_rows(const dual_simplex::user_problem_t<i_t, f_t>& up,
+                    const dual_simplex::simplex_solver_settings_t<i_t, f_t>& settings,
+                    i_t old_user_rows,
+                    i_t count,
+                    i_t structural_cols,
+                    dual_simplex_warm_state_t<i_t, f_t>& state,
+                    dual_simplex::lp_solution_t<i_t, f_t>& solution)
+{
+  auto& lp = *state.lp;
+
+  // Build the cut matrix C (count x lp.num_cols) in CSR. Each appended user row
+  // i references user (structural) columns only; those columns map identically
+  // into lp's structural prefix, so no index translation is needed. The cut is
+  // expressed as C x <= d. A '<=' user row a^T x <= b becomes C row = a, d = b.
+  dual_simplex::csr_matrix_t<i_t, f_t> Arow_user(0, 0, 0);
+  up.A.to_compressed_row(Arow_user);
+
+  i_t cut_nnz = 0;
+  for (i_t i = old_user_rows; i < old_user_rows + count; ++i) {
+    cut_nnz += Arow_user.row_start[i + 1] - Arow_user.row_start[i];
+  }
+  dual_simplex::csr_matrix_t<i_t, f_t> cuts(count, lp.num_cols, cut_nnz);
+  std::vector<f_t> cut_rhs(count);
+  i_t nz = 0;
+  for (i_t k = 0; k < count; ++k) {
+    const i_t i        = old_user_rows + k;
+    cuts.row_start[k]  = nz;
+    for (i_t p = Arow_user.row_start[i]; p < Arow_user.row_start[i + 1]; ++p) {
+      cuts.j[nz] = Arow_user.j[p];  // structural column index == lp column index
+      cuts.x[nz] = Arow_user.x[p];
+      ++nz;
+    }
+    cut_rhs[k] = up.rhs[i];
+  }
+  cuts.row_start[count] = nz;
+  (void)structural_cols;
+
+  return dual_simplex::add_cuts<i_t, f_t>(settings,
+                                          cuts,
+                                          cut_rhs,
+                                          lp,
+                                          state.new_slacks,
+                                          solution,
+                                          *state.basis_update,
+                                          state.basic_list,
+                                          state.nonbasic_list,
+                                          state.vstatus,
+                                          state.edge_norms);
+}
+
+// Re-optimize state.lp from the transplanted basis, restoring DUAL FEASIBILITY
+// first (BUG 3). A freshly appended attractive column (reduced cost z_j < 0,
+// the normal Dantzig-Wolfe / column-generation case) leaves the transplanted
+// basis dual-INFEASIBLE. Dual phase-2 assumes dual feasibility and only
+// restores PRIMAL feasibility; calling it directly can declare OPTIMAL at a
+// dual-infeasible, non-optimal point (set_primal_variables_on_bounds parks a
+// one-sided [0,+inf) column at its lower bound rather than pivoting it in).
+//
+// We mirror what the cold solve_linear_program_with_advanced_basis does, but
+// seeded from the WARM basis instead of an all-slack one (so we keep the
+// warm-start benefit): run a dual phase-1 (create_phase1_problem shares
+// state.lp->A and the same basis structure, so the transplanted
+// vstatus/ft/basic_list/nonbasic_list are valid for it) to drive dual
+// infeasibility to zero, then run dual phase-2 to optimum. If phase-1 already
+// reports dual feasibility (phase1 objective ~ 0) we still run phase-2 — it is
+// a no-op-to-few-pivots warm continuation.
+//
+// Under the forced identity presolve/scaling flags (make_warm_settings) this
+// all stays in state.lp coordinates, matching the cold rebuild's terminus.
+template <typename i_t, typename f_t>
+dual_simplex::dual::status_t warm_reoptimize(const dual_simplex::simplex_solver_settings_t<i_t, f_t>& settings,
+                               f_t start_time,
+                               dual_simplex_warm_state_t<i_t, f_t>& state,
+                               dual_simplex::lp_solution_t<i_t, f_t>& lp_solution,
+                               i_t& iter)
+{
+  auto& lp = *state.lp;
+
+  // --- Dual phase 1 from the warm basis: restore dual feasibility. ---
+  dual_simplex::lp_problem_t<i_t, f_t> phase1_problem(lp.handle_ptr, 1, 1, 1);
+  dual_simplex::create_phase1_problem(lp, phase1_problem);
+
+  dual_simplex::lp_solution_t<i_t, f_t> phase1_solution(phase1_problem.num_rows,
+                                                        phase1_problem.num_cols);
+  // Seed phase 1 from the transplanted basis (vstatus / ft / basic_list /
+  // nonbasic_list). initialize_basis=false: ft already factors the current B.
+  bool initialize_basis = false;
+  dual_simplex::dual::status_t phase1_status =
+    dual_simplex::dual_phase2_with_advanced_basis<i_t, f_t>(1,
+                                                            0,
+                                                            initialize_basis,
+                                                            start_time,
+                                                            phase1_problem,
+                                                            settings,
+                                                            state.vstatus,
+                                                            *state.basis_update,
+                                                            state.basic_list,
+                                                            state.nonbasic_list,
+                                                            phase1_solution,
+                                                            iter,
+                                                            state.edge_norms,
+                                                            nullptr);
+  if (phase1_status != dual_simplex::dual::status_t::OPTIMAL) {
+    // Could not restore dual feasibility from the warm basis (numerical, limit,
+    // or genuinely dual-infeasible -> primal unbounded/infeasible). Let the
+    // caller fall back to a cold rebuild, which runs the full phase-1/phase-2
+    // from an all-slack basis and reports the correct terminal status.
+    return phase1_status;
+  }
+  // Phase 1 minimizes the dual infeasibility. Reaching status OPTIMAL is not
+  // enough: the minimized phase-1 objective must be ~0 (dual feasibility
+  // achieved). A residual phase-1 objective means the problem is genuinely
+  // dual-infeasible -> primal unbounded or infeasible. The cold path makes the
+  // identical check (solve.cpp: phase1_obj > -primal_tol). We bail to a cold
+  // rebuild, which disambiguates and returns the authoritative status, rather
+  // than running phase-2 on a still-dual-infeasible basis (which could declare
+  // a wrong OPTIMAL).
+  if (phase1_solution.objective <= -settings.primal_tol) {
+    return dual_simplex::dual::status_t::DUAL_UNBOUNDED;
+  }
+  // create_phase1_problem reuses lp.A, so the basis (ft / lists) and the
+  // edge_norms produced for the phase-1 problem are directly reusable for the
+  // phase-2 solve below (same column structure). We keep state.vstatus as the
+  // dual-feasible basis phase-1 ended on.
+
+  // --- Dual phase 2 from the now dual-feasible basis: drive to optimum. ---
+  state.edge_norms.clear();
+  return dual_simplex::dual_phase2_with_advanced_basis<i_t, f_t>(2,
+                                                                 0,
+                                                                 initialize_basis,
+                                                                 start_time,
+                                                                 lp,
+                                                                 settings,
+                                                                 state.vstatus,
+                                                                 *state.basis_update,
+                                                                 state.basic_list,
+                                                                 state.nonbasic_list,
+                                                                 lp_solution,
+                                                                 iter,
+                                                                 state.edge_norms,
+                                                                 nullptr);
+}
+
+}  // namespace warm_ds
+
+template <typename i_t, typename f_t>
+optimization_problem_solution_t<i_t, f_t> solve_lp_dual_simplex_warm(
+  optimization_problem_t<i_t, f_t>& op_problem,
+  pdlp_solver_settings_t<i_t, f_t> const& settings,
+  dual_simplex_warm_state_t<i_t, f_t>& state)
+{
+  if constexpr (std::is_same_v<f_t, double>) {
+    auto timer = cuopt::timer_t(settings.time_limit);
+    const f_t start_time = dual_simplex::tic();
+
+    // Convert the current device problem to a host user_problem.
+    dual_simplex::user_problem_t<i_t, f_t> up =
+      cuopt_optimization_problem_to_user_problem<i_t, f_t>(op_problem.get_handle_ptr(), op_problem);
+
+    auto ds_settings = warm_ds::make_warm_settings<i_t, f_t>(settings);
+
+    const f_t norm_user_objective = dual_simplex::vector_norm2<i_t, f_t>(up.objective);
+    const f_t norm_rhs            = dual_simplex::vector_norm2<i_t, f_t>(up.rhs);
+
+    // Decide whether to warm-transplant or cold-rebuild. We warm-transplant
+    // only on a tail-only structural extension whose appended rows are ALL
+    // '<=' (add_cuts models <= rows). A mixed/equality/range append, a delete,
+    // a coefficient edit, or the first solve falls back to a cold rebuild.
+    bool can_warm = warm_ds::is_tail_extension<i_t, f_t>(up, state);
+    if (can_warm) {
+      for (i_t i = state.user_num_rows; i < up.num_rows; ++i) {
+        if (up.row_sense[i] != 'L') {
+          can_warm = false;
+          break;
+        }
+      }
+    }
+
+    dual_simplex::lp_solution_t<i_t, f_t> user_solution(up.num_rows, up.num_cols);
+    dual_simplex::lp_status_t status = dual_simplex::lp_status_t::UNSET;
+
+    if (can_warm) {
+      const i_t old_user_cols = state.user_num_cols;
+      const i_t old_user_rows = state.user_num_rows;
+      const i_t add_cols      = up.num_cols - old_user_cols;
+      const i_t add_rows      = up.num_rows - old_user_rows;
+
+      // 1) Append new structural columns as nonbasic (cheap; basis unchanged).
+      if (add_cols > 0) {
+        warm_ds::append_nonbasic_columns<i_t, f_t>(up, old_user_cols, add_cols, state);
+      }
+
+      // 2) Append new '<=' rows as cuts (slack basic; basis_update updated).
+      dual_simplex::lp_solution_t<i_t, f_t> lp_solution(state.lp->num_rows, state.lp->num_cols);
+      lp_solution.x.assign(state.lp->num_cols, 0.0);
+      lp_solution.y.assign(state.lp->num_rows, 0.0);
+      lp_solution.z.assign(state.lp->num_cols, 0.0);
+      if (add_rows > 0) {
+        const i_t rc = warm_ds::append_cut_rows<i_t, f_t>(
+          up, ds_settings, old_user_rows, add_rows, old_user_cols, state, lp_solution);
+        if (rc != 0) {
+          // add_cuts failed (e.g. a cut column index out of range). Drop the
+          // warm state and fall back to a cold rebuild below.
+          can_warm = false;
+        }
+      }
+
+      if (can_warm) {
+        // 3) Re-optimize from the warm basis. warm_reoptimize runs a dual
+        // phase-1 (seeded from the transplanted basis) to restore dual
+        // feasibility — a freshly appended attractive column makes the basis
+        // dual-infeasible — then a dual phase-2 to the true optimum, in lp
+        // coordinates (no presolve/scaling). See BUG 3 note on warm_reoptimize.
+        lp_solution.resize(state.lp->num_rows, state.lp->num_cols);
+        i_t iter                             = 0;
+        dual_simplex::dual::status_t dstatus =
+          warm_ds::warm_reoptimize<i_t, f_t>(ds_settings, start_time, state, lp_solution, iter);
+
+        if (dstatus == dual_simplex::dual::status_t::OPTIMAL) {
+          status = dual_simplex::lp_status_t::OPTIMAL;
+        } else {
+          // Any non-OPTIMAL warm terminus (dual-unbounded, time/iteration
+          // limit, numerical, or a phase-1 failure to restore dual
+          // feasibility) falls back to a cold rebuild. The cold path runs the
+          // full phase-1/phase-2 from an all-slack basis and reports the
+          // authoritative terminal status — warm phase-1's DUAL_UNBOUNDED, for
+          // instance, is "unbounded OR infeasible", which only the cold solve
+          // disambiguates. This keeps the warm path's returned status and
+          // objective identical to a from-scratch solve.
+          can_warm = false;
+        }
+
+        if (can_warm) {
+          // Map the lp-space solution back to user space (identity prefix for
+          // structural columns + sign flip already absent since no 'G' rows).
+          dual_simplex::uncrush_primal_solution(up, *state.lp, lp_solution.x, user_solution.x);
+          dual_simplex::uncrush_dual_solution(
+            up, *state.lp, lp_solution.y, lp_solution.z, user_solution.y, user_solution.z);
+          const f_t obj = dual_simplex::compute_objective(*state.lp, lp_solution.x);
+          user_solution.objective      = obj;
+          user_solution.user_objective = dual_simplex::compute_user_objective(*state.lp, obj);
+          user_solution.iterations     = iter;
+          // Residuals (abs) for the additional-termination-information fields.
+          std::vector<f_t> primal_residual = state.lp->rhs;
+          dual_simplex::matrix_vector_multiply(
+            state.lp->A, f_t(1.0), lp_solution.x, f_t(-1.0), primal_residual);
+          user_solution.l2_primal_residual =
+            dual_simplex::vector_norm2<i_t, f_t>(primal_residual);
+          user_solution.l2_dual_residual = 0.0;
+
+          // Refresh the snapshot so the NEXT resolve extends from this state.
+          warm_ds::snapshot_user_problem<i_t, f_t>(up, state);
+        }
+      }
+    }
+
+    if (!can_warm) {
+      // Cold rebuild: convert fresh, capture a brand-new basis. This is the
+      // fallback that also seeds the very first solve.
+      dual_simplex::lp_problem_t<i_t, f_t> original_lp(up.handle_ptr, 1, 1, 1);
+      std::vector<i_t> new_slacks;
+      dual_simplex::dualize_info_t<i_t, f_t> dualize_info;
+      dual_simplex::convert_user_problem(up, ds_settings, original_lp, new_slacks, dualize_info);
+
+      dual_simplex::lp_solution_t<i_t, f_t> lp_solution(original_lp.num_rows, original_lp.num_cols);
+      auto basis_update =
+        dual_simplex::basis_update_mpf_t<i_t, f_t>(original_lp.num_rows, ds_settings.refactor_frequency);
+      std::vector<i_t> basic_list(original_lp.num_rows);
+      std::vector<i_t> nonbasic_list;
+      std::vector<dual_simplex::variable_status_t> vstatus;
+      std::vector<f_t> edge_norms;
+
+      status = dual_simplex::solve_linear_program_with_advanced_basis<i_t, f_t>(original_lp,
+                                                                                start_time,
+                                                                                ds_settings,
+                                                                                lp_solution,
+                                                                                basis_update,
+                                                                                basic_list,
+                                                                                nonbasic_list,
+                                                                                vstatus,
+                                                                                edge_norms,
+                                                                                nullptr);
+
+      // Map back to user space.
+      user_solution.resize(up.num_rows, up.num_cols);
+      dual_simplex::uncrush_primal_solution(up, original_lp, lp_solution.x, user_solution.x);
+      dual_simplex::uncrush_dual_solution(
+        up, original_lp, lp_solution.y, lp_solution.z, user_solution.y, user_solution.z);
+      user_solution.objective          = lp_solution.objective;
+      user_solution.user_objective     = lp_solution.user_objective;
+      user_solution.iterations         = lp_solution.iterations;
+      user_solution.l2_primal_residual = lp_solution.l2_primal_residual;
+      user_solution.l2_dual_residual   = lp_solution.l2_dual_residual;
+
+      // Persist the basis ONLY when it is in lp coordinates (i.e. presolve +
+      // scaling were the identity). With our warm settings and a clean LP this
+      // holds; we guard it by checking the captured basis dimensions match the
+      // converted lp. If presolve actually reduced the problem (empty rows),
+      // num_cols/num_rows of the captured basis would not match original_lp, so
+      // we refuse to persist and the next resolve cold-rebuilds again.
+      const bool basis_in_lp_coords =
+        status == dual_simplex::lp_status_t::OPTIMAL &&
+        static_cast<i_t>(vstatus.size()) == original_lp.num_cols &&
+        static_cast<i_t>(basic_list.size()) == original_lp.num_rows &&
+        static_cast<i_t>(edge_norms.size()) == original_lp.num_cols;
+      if (basis_in_lp_coords) {
+        state.lp.emplace(std::move(original_lp));
+        state.new_slacks    = std::move(new_slacks);
+        state.basis_update.emplace(std::move(basis_update));
+        state.basic_list    = std::move(basic_list);
+        state.nonbasic_list = std::move(nonbasic_list);
+        state.vstatus       = std::move(vstatus);
+        state.edge_norms    = std::move(edge_norms);
+        state.has_basis     = true;
+        warm_ds::snapshot_user_problem<i_t, f_t>(up, state);
+      } else {
+        state.has_basis = false;
+      }
+    }
+
+    if (settings.concurrent_halt != nullptr &&
+        (status == dual_simplex::lp_status_t::OPTIMAL ||
+         status == dual_simplex::lp_status_t::UNBOUNDED ||
+         status == dual_simplex::lp_status_t::INFEASIBLE ||
+         status == dual_simplex::lp_status_t::UNBOUNDED_OR_INFEASIBLE)) {
+      *settings.concurrent_halt = 1;
+    }
+
+    return convert_dual_simplex_sol(op_problem,
+                                    user_solution,
+                                    status,
+                                    timer.elapsed_time(),
+                                    norm_user_objective,
+                                    norm_rhs,
+                                    method_t::DualSimplex);
+  } else {
+    cuopt_expects(false,
+                  error_type_t::ValidationError,
+                  "Dual-simplex warm-state resolve requires double precision.");
+    // Unreachable; satisfies the non-void return for the float instantiation.
+    return optimization_problem_solution_t<i_t, f_t>(
+      pdlp_termination_status_t::NumericalError, op_problem.get_handle_ptr()->get_stream());
+  }
+}
+
 template <typename i_t, typename f_t>
 std::tuple<dual_simplex::lp_solution_t<i_t, f_t>, dual_simplex::lp_status_t, f_t, f_t, f_t>
 run_barrier(dual_simplex::user_problem_t<i_t, f_t>& user_problem,
@@ -516,6 +1137,13 @@ run_barrier(dual_simplex::user_problem_t<i_t, f_t>& user_problem,
   barrier_settings.barrier_relaxed_feasibility_tol = settings.tolerances.relative_primal_tolerance;
   barrier_settings.barrier_relaxed_optimality_tol  = settings.tolerances.relative_dual_tolerance;
   barrier_settings.barrier_relaxed_complementarity_tol = settings.tolerances.relative_gap_tolerance;
+  // Skip inner-presolve optimization passes (empty row/col removal, folding)
+  // on the barrier path — outer PSLP/Papilo has already done equivalent work,
+  // and re-running per-iter in a delta-API resolve loop is wasted CPU. The
+  // simplex_solver_settings_t default (true) keeps the dual-simplex path
+  // unchanged. Mandatory correctness transforms (LB shift, free-variable v-w
+  // split, gated by barrier_presolve) still always run.
+  barrier_settings.inner_presolve_optimizations = false;
   if (barrier_settings.concurrent_halt != nullptr) {
     // Don't show the barrier log in concurrent mode. Show the PDLP log instead
     barrier_settings.log.log = false;
@@ -2351,5 +2979,13 @@ INSTANTIATE(float)
 #if MIP_INSTANTIATE_DOUBLE
 INSTANTIATE(double)
 #endif
+
+// The dual-simplex warm-state layer is double-only (the dual_simplex internals
+// it wraps — solve_linear_program_with_advanced_basis, add_cuts,
+// dual_phase2_with_advanced_basis — are instantiated for <int,double> only).
+template optimization_problem_solution_t<int, double> solve_lp_dual_simplex_warm(
+  optimization_problem_t<int, double>& op_problem,
+  pdlp_solver_settings_t<int, double> const& settings,
+  dual_simplex_warm_state_t<int, double>& state);
 
 }  // namespace cuopt::linear_programming
