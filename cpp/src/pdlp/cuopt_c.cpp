@@ -70,18 +70,9 @@ class c_set_solution_callback_t : public cuopt::internals::set_solution_callback
   cuOptMIPSetSolutionCallback callback_;
 };
 
-// Owns solver settings and C callback wrappers for C API lifetime.
-struct solver_settings_handle_t {
-  solver_settings_handle_t() : settings(new solver_settings_t<cuopt_int_t, cuopt_float_t>()) {}
-  ~solver_settings_handle_t() { delete settings; }
-  solver_settings_t<cuopt_int_t, cuopt_float_t>* settings;
-  std::vector<std::unique_ptr<cuopt::internals::base_solution_callback_t>> callbacks;
-};
-
-solver_settings_handle_t* get_settings_handle(cuOptSolverSettings settings)
-{
-  return static_cast<solver_settings_handle_t*>(settings);
-}
+// solver_settings_handle_t and get_settings_handle were lifted into
+// <pdlp/cuopt_c_internal.hpp> so cuopt_c_delta.cpp can reach the settings
+// through the opaque handle too.
 
 namespace {
 
