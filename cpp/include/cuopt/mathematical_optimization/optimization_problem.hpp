@@ -227,6 +227,36 @@ class optimization_problem_t : public optimization_problem_interface_t<i_t, f_t>
   void set_variable_types(const var_t* variable_types, i_t size) override;
   /** @copydoc optimization_problem_interface_t::set_problem_category */
   void set_problem_category(const problem_category_t& category) override;
+
+  /**
+   * @brief Set the variable count without touching the existing device buffers.
+   *
+   * Used by the delta C API when it has already resized the underlying
+   * device_uvectors (objective, variable bounds, variable types) directly and
+   * just needs n_vars_ to reflect the new size. Direct callers should normally
+   * use the size-bearing setters instead.
+   */
+  void set_n_variables(i_t n_variables);
+
+  /**
+   * @brief Set the constraint count without touching the existing device
+   * buffers. Counterpart to set_n_variables for the constraint side.
+   */
+  void set_n_constraints(i_t n_constraints);
+
+  /**
+   * @brief Drop the row-types (constraint-sense) array, resizing it to empty
+   * without touching n_constraints_. Used by the delta C API to normalise a
+   * problem to the ranged (lower/upper bounds) representation.
+   */
+  void clear_row_types();
+
+  /**
+   * @brief Drop the constraint-bounds (RHS) array, resizing it to empty without
+   * touching n_constraints_. Counterpart to clear_row_types.
+   */
+  void clear_constraint_bounds();
+
   /** @copydoc optimization_problem_interface_t::set_constraint_lower_bounds */
   void set_constraint_lower_bounds(const f_t* constraint_lower_bounds, i_t size) override;
   /** @copydoc optimization_problem_interface_t::set_constraint_upper_bounds */
