@@ -88,20 +88,24 @@ class sparse_cholesky_base_t {
 // RMM pool fragmentation makes the workspace size smaller than the actual free space on the GPU
 // Use cudaMallocAsync instead of the RMM pool until we reduce our memory footprint/fragmentation.
 // TODO: Still use RMM for smaller problems to benefit from their allocation optimizations.
+// cuDSS invokes these as C device-memory-handler callbacks during
+// factorization. They MUST return a non-zero error code on failure, not throw:
+// unwinding a C++ exception through cuDSS's C frames is undefined behaviour and
+// can corrupt solver/GPU state, which lets a failed factorization (e.g. an
+// out-of-memory cudaMallocAsync) be reported as OPTIMAL with a garbage solution.
+// Returning the CUDA error lets cuDSS fail the factorize cleanly, which the
+// barrier surfaces as a numerical-issues / suboptimal termination (via its
+// `status < 0` path) instead of a corrupted OPTIMAL.
 template <typename mem_pool_t>
 int cudss_device_alloc(void* ctx, void** ptr, size_t size, cudaStream_t stream)
 {
-  int status = cudaMallocAsync(ptr, size, stream);
-  if (status != cudaSuccess) { throw raft::cuda_error("Cuda error in cudss_device_alloc"); }
-  return status;
+  return static_cast<int>(cudaMallocAsync(ptr, size, stream));
 }
 
 template <typename mem_pool_t>
 int cudss_device_dealloc(void* ctx, void* ptr, size_t size, cudaStream_t stream)
 {
-  int status = cudaFreeAsync(ptr, stream);
-  if (status != cudaSuccess) { throw raft::cuda_error("Cuda error in cudss_device_dealloc"); }
-  return status;
+  return static_cast<int>(cudaFreeAsync(ptr, stream));
 }
 
 template <class T>
